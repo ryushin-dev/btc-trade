@@ -19,6 +19,7 @@ class Report:
     fees_paid: float  # 正なら支払い超過、負ならリベート超過
     maker_fills: int
     taker_fills: int
+    rejected_orders: int = 0
 
     @property
     def profitable(self) -> bool:
@@ -40,14 +41,19 @@ class Report:
                 f"最大ドローダウン {self.max_drawdown_pct:.3f}%",
                 f"約定数          {self.fills} (maker {self.maker_fills} / taker {self.taker_fills})",
                 f"往復取引        {self.round_trips} 回, 勝率 {self.win_rate_pct:.1f}%",
-                f"手数料合計      {self.fees_paid:+,.0f} JPY",
+                f"手数料合計      {self.fees_paid:+,.0f} JPY（期末の清算売りを含む）",
+                f"拒否された注文  {self.rejected_orders}",
                 f"判定            {verdict}",
             ]
         )
 
 
 def build_report(
-    equity_curve: list[float], fills: list[Fill], first_price: float, last_price: float
+    equity_curve: list[float],
+    fills: list[Fill],
+    first_price: float,
+    last_price: float,
+    rejected_orders: int = 0,
 ) -> Report:
     start, end = equity_curve[0], equity_curve[-1]
     peak, max_dd = start, 0.0
@@ -70,6 +76,7 @@ def build_report(
         fees_paid=sum(f.fee_jpy for f in fills),
         maker_fills=sum(1 for f in fills if f.liquidity == "maker"),
         taker_fills=sum(1 for f in fills if f.liquidity == "taker"),
+        rejected_orders=rejected_orders,
     )
 
 

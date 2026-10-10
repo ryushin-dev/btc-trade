@@ -11,6 +11,7 @@ from .exchange.public import BitbankPublic
 from .fees import BITBANK_BTC_JPY, FeeSchedule
 from .paper import PaperTrader
 from .strategies import STRATEGIES, build_strategy
+from .validate import validate
 
 
 def _params(items: list[str]) -> dict[str, str]:
@@ -35,6 +36,8 @@ def _add_trading_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--param", action="append", default=[], help="戦略パラメータ key=value（複数可）")
     p.add_argument("--cash", type=float, default=100_000, help="初期資金 JPY")
     p.add_argument("--slippage", type=float, default=0.0005, help="成行のスリッページ率")
+    p.add_argument("--participation", type=float, default=0.1, help="指値が取れる出来高の割合")
+    p.add_argument("--max-daily-loss", type=float, default=0.03, help="1日の損失がこの割合を超えたら新規買い停止")
     p.add_argument("--maker-fee", type=float, default=None)
     p.add_argument("--taker-fee", type=float, default=None)
 
@@ -57,6 +60,12 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--json", action="store_true", help="結果を JSON で出力")
     _add_trading_args(b)
 
+    v = sub.add_parser("validate", help="期間分割とコスト悪化で収益性を検証")
+    v.add_argument("--data", required=True, help="fetch で保存した CSV")
+    v.add_argument("--folds", type=int, default=4)
+    v.add_argument("--min-trades", type=int, default=10, help="各期間で必要な最低往復回数")
+    _add_trading_args(v)
+
     p = sub.add_parser("paper", help="ペーパートレード（実注文なし）")
     p.add_argument("--pair", default="btc_jpy")
     p.add_argument("--poll", type=float, default=10.0, help="ポーリング間隔（秒）")
@@ -75,7 +84,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "backtest":
         bars = load_csv(args.data) if args.data else synthetic_bars(args.synthetic)
-        report, _, _ = run_backtest(bars, strategy, args.cash, _fees(args), args.slippage)
+        report, _, _ = run_backtest(
+            bars, strategy, args.cash, _fees(args), args.slippage, args.participation, args.max_daily_loss
+        )
         if args.json:
             json.dump(report.to_dict(), sys.stdout, ensure_ascii=False, indent=2)
             print()
@@ -84,13 +95,35 @@ def main(argv: list[str] | None = None) -> int:
             print(report.format())
         return 0
 
+    if args.cmd == "validate":
+        params = _params(args.param)
+        result = validate(
+            load_csv(args.data),
+            lambda: build_strategy(args.strategy, params),
+            folds=args.folds,
+            cash_jpy=args.cash,
+            fees=_fees(args),
+            slippage=args.slippage,
+            participation=args.participation,
+            min_trades=args.min_trades,
+            max_daily_loss=args.max_daily_loss,
+        )
+        print(f"戦略 {args.strategy} {params}")
+        print(result.format())
+        return 0 if result.passed else 2
+
     if args.cmd == "paper":
         trader = PaperTrader(
-            strategy, BitbankPublic(), args.cash, _fees(args), args.slippage, args.pair, args.log_dir
+            strategy,
+            BitbankPublic(),
+            args.cash,
+            _fees(args),
+            args.slippage,
+            args.pair,
+            args.log_dir,
+            participation=args.participation,
+            max_daily_loss=args.max_daily_loss,
         )
-        try:
-            trader.run(args.poll)
-        except KeyboardInterrupt:
-            print("\nstopped")
+        trader.run(args.poll)
         return 0
     return 1

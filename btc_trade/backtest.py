@@ -16,18 +16,23 @@ def run_backtest(
     cash_jpy: float = 100_000,
     fees: FeeSchedule = BITBANK_BTC_JPY,
     slippage: float = 0.0005,
+    participation: float = 0.1,
+    max_daily_loss: float = 0.03,
 ) -> tuple[Report, list[Fill], list[float]]:
+    """equity は各バー終値時点の清算価値（手仕舞いコスト込み）。
+
+    期末に残った保有は成行売却の Fill（tag="liquidation"）として記帳し、手数料・勝率にも含める。
+    """
     bars = list(bars)
     if len(bars) < 2:
         raise ValueError("need at least 2 bars")
-    broker = SimBroker(cash_jpy, fees, slippage=slippage)
-    engine = Engine(strategy, broker)
+    broker = SimBroker(cash_jpy, fees, slippage=slippage, participation=participation)
+    engine = Engine(strategy, broker, max_daily_loss=max_daily_loss)
     equity = [cash_jpy]
     for bar in bars:
         engine.step(bar)
-        equity.append(broker.equity(bar.close))
-    # 保有が残っていれば、成行で手仕舞った場合の価値（Taker 手数料・スリッページ込み）で評価する
-    last = bars[-1].close * (1 - slippage)
-    equity[-1] = broker.cash + broker.btc * last * (1 - fees.taker)
-    report = build_report(equity, broker.fills, bars[0].open, bars[-1].close)
+        equity.append(broker.liquidation_value(bar.close))
+    broker.liquidate(bars[-1].ts, bars[-1].close)
+    equity[-1] = broker.cash
+    report = build_report(equity, broker.fills, bars[0].open, bars[-1].close, len(broker.rejected))
     return report, broker.fills, equity

@@ -2,8 +2,15 @@
 
 https://github.com/bitbankinc/bitbank-api-docs/blob/master/rest-api.md
 
-安全装置: 発注・取消は `live=True` かつ環境変数 BTC_TRADE_ENABLE_LIVE=1 の両方がそろわない限り
-LiveTradingDisabled を送出する。残高や注文の参照はキーさえあれば可能。
+安全装置:
+- 発注・取消は `live=True` かつ環境変数 BTC_TRADE_ENABLE_LIVE=1 の両方がそろわない限り
+  LiveTradingDisabled を送出する。残高や注文の参照はキーさえあれば可能。
+- 発注・取消の結果が分からないまま失敗した場合（タイムアウト、通信断、5xx など）は
+  OrderStateUnknown を送出してクライアントを停止状態にする。停止中は新規の発注・取消を受け付けない。
+  reconcile() で取引所側の未約定注文と約定履歴を取得し、照合したうえで resume() を呼ぶまで再開しない。
+  自動再試行はしない（受け付け済みの注文を二重に出さないため）。
+- ACCESS-NONCE はプロセス内で必ず単調増加させる。同じキーを複数プロセスで同時に使わないこと。
+
 APIキーは「参照」と「取引」のみ許可し、「出金」は絶対に許可しないこと。
 """
 
@@ -13,7 +20,9 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -24,6 +33,37 @@ PRIVATE_BASE = "https://api.bitbank.cc"
 
 class LiveTradingDisabled(RuntimeError):
     pass
+
+
+class OrderStateUnknown(RuntimeError):
+    """発注・取消が取引所に届いたか分からない。照合するまで新規の発注をしてはいけない。"""
+
+
+_nonce_lock = threading.Lock()
+_last_nonce = 0
+
+
+def next_nonce() -> int:
+    """ミリ秒時刻を基本に、同一ミリ秒や時計の巻き戻りでも必ず前回より大きい値を返す。"""
+    global _last_nonce
+    with _nonce_lock:
+        _last_nonce = max(int(time.time() * 1000), _last_nonce + 1)
+        return _last_nonce
+
+
+def load_env_file(path: str | os.PathLike = ".env") -> None:
+    """KEY=VALUE 形式の .env を読み、未設定の環境変数だけを埋める。"""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def sign(secret: str, message: str) -> str:
@@ -39,6 +79,7 @@ class BitbankPrivate:
         base: str = PRIVATE_BASE,
         timeout: float = 10.0,
     ) -> None:
+        load_env_file()
         self.api_key = api_key or os.environ.get("BITBANK_API_KEY", "")
         self.api_secret = api_secret or os.environ.get("BITBANK_API_SECRET", "")
         if not self.api_key or not self.api_secret:
@@ -46,9 +87,10 @@ class BitbankPrivate:
         self.live = live and os.environ.get("BTC_TRADE_ENABLE_LIVE") == "1"
         self.base = base.rstrip("/")
         self.timeout = timeout
+        self.halted = False
 
     def _headers(self, message_suffix: str) -> dict[str, str]:
-        nonce = str(int(time.time() * 1000))
+        nonce = str(next_nonce())
         return {
             "ACCESS-KEY": self.api_key,
             "ACCESS-NONCE": nonce,
@@ -74,12 +116,43 @@ class BitbankPrivate:
             raise BitbankError(payload.get("data", {}).get("code"), path)
         return payload["data"]
 
+    def _mutate(self, path: str, params: dict) -> dict:
+        """結果が分からない失敗では停止状態にする。取引所がエラーを返した場合（注文は不成立）は停止しない。"""
+        self._require_live()
+        if self.halted:
+            raise OrderStateUnknown("前回の発注・取消の結果が未確認です。reconcile() で照合してから resume() してください。")
+        try:
+            return self._request("POST", path, params)
+        except BitbankError:
+            raise
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            self.halted = True
+            raise OrderStateUnknown(f"{path} の結果が不明です（HTTP {e.code}）") from e
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            self.halted = True
+            raise OrderStateUnknown(f"{path} の結果が不明です（{e!r}）") from e
+
+    def reconcile(self, pair: str = "btc_jpy") -> dict:
+        """取引所側の未約定注文と直近の約定履歴を返す。呼び出し側で照合してから resume() すること。"""
+        return {
+            "active_orders": self.active_orders(pair),
+            "trade_history": self.trade_history(pair),
+        }
+
+    def resume(self) -> None:
+        self.halted = False
+
     # --- 参照系 ---
     def assets(self) -> dict:
         return self._request("GET", "/v1/user/assets")
 
     def active_orders(self, pair: str = "btc_jpy") -> dict:
         return self._request("GET", "/v1/user/spot/active_orders", {"pair": pair})
+
+    def trade_history(self, pair: str = "btc_jpy") -> dict:
+        return self._request("GET", "/v1/user/spot/trade_history", {"pair": pair})
 
     # --- 発注系（安全装置つき） ---
     def _require_live(self) -> None:
@@ -97,14 +170,12 @@ class BitbankPrivate:
         price: str | None = None,
         post_only: bool = False,
     ) -> dict:
-        self._require_live()
         params: dict = {"pair": pair, "side": side, "type": order_type, "amount": amount}
         if price is not None:
             params["price"] = price
         if post_only:
             params["post_only"] = True
-        return self._request("POST", "/v1/user/spot/order", params)
+        return self._mutate("/v1/user/spot/order", params)
 
     def cancel_order(self, pair: str, order_id: int) -> dict:
-        self._require_live()
-        return self._request("POST", "/v1/user/spot/cancel_order", {"pair": pair, "order_id": order_id})
+        return self._mutate("/v1/user/spot/cancel_order", {"pair": pair, "order_id": order_id})
